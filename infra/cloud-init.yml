@@ -1,0 +1,215 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - jq
+
+runcmd:
+  # Install Docker
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  
+  # Install Azure CLI
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+  
+  # Start and enable Docker service
+  - systemctl start docker
+  - systemctl enable docker
+  
+  # Add user to docker group
+  - usermod -aG docker ${admin_username}
+  
+  # Configure Docker to start on boot
+  - systemctl enable docker.service
+  - systemctl enable containerd.service
+  
+  # Create directories
+  - mkdir -p /var/log/webapi
+  - mkdir -p /opt/deployment
+  - chown ${admin_username}:${admin_username} /var/log/webapi
+  - chown ${admin_username}:${admin_username} /opt/deployment
+  
+  # Enable and start deployment service
+  - systemctl daemon-reload
+  - systemctl enable auto-deploy.service
+  - systemctl start auto-deploy.timer
+
+write_files:
+  - content: |
+      #!/bin/bash
+      
+      # Configuration
+      ACR_NAME="${acr_name}"
+      IMAGE_NAME="webapi"
+      CONTAINER_NAME="webapi"
+      
+      # Function to log messages
+      log() {
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a /var/log/webapi/deploy.log
+      }
+      
+      # Function to get ACR credentials and login
+      acr_login() {
+          log "Logging into ACR..."
+          
+          # Get access token using managed identity
+          ACCESS_TOKEN=$(curl -s -H "Metadata: true" \
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" | \
+              jq -r '.access_token')
+          
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+              log "Failed to get access token"
+              return 1
+          fi
+          
+          # Get ACR login server
+          ACR_LOGIN_SERVER="$ACR_NAME.azurecr.io"
+          
+          # Get ACR refresh token
+          ACR_REFRESH_TOKEN=$(curl -s -X POST \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "grant_type=access_token&service=$ACR_LOGIN_SERVER&access_token=$ACCESS_TOKEN" \
+              "https://$ACR_LOGIN_SERVER/oauth2/exchange" | jq -r '.refresh_token')
+          
+          if [ -z "$ACR_REFRESH_TOKEN" ] || [ "$ACR_REFRESH_TOKEN" = "null" ]; then
+              log "Failed to get ACR refresh token"
+              return 1
+          fi
+          
+          # Login to Docker with ACR
+          echo "$ACR_REFRESH_TOKEN" | docker login "$ACR_LOGIN_SERVER" -u 00000000-0000-0000-0000-000000000000 --password-stdin
+          
+          if [ $? -eq 0 ]; then
+              log "Successfully logged into ACR"
+              return 0
+          else
+              log "Failed to login to ACR"
+              return 1
+          fi
+      }
+      
+      # Function to deploy application
+      deploy_app() {
+          log "Starting deployment process..."
+          
+          # Login to ACR
+          if ! acr_login; then
+              log "ACR login failed, aborting deployment"
+              return 1
+          fi
+          
+          # Pull latest image
+          IMAGE_URL="$ACR_NAME.azurecr.io/$IMAGE_NAME:latest"
+          log "Pulling image: $IMAGE_URL"
+          
+          if ! docker pull "$IMAGE_URL"; then
+              log "Failed to pull image: $IMAGE_URL"
+              return 1
+          fi
+          
+          # Stop and remove existing container
+          log "Stopping existing container..."
+          docker stop "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+          
+          # Run new container
+          log "Starting new container..."
+          docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p 80:3000 \
+              "$IMAGE_URL"
+          
+          if [ $? -eq 0 ]; then
+              log "Container started successfully"
+              
+              # Wait for application to be ready
+              sleep 10
+              
+              # Health check
+              if curl -f -s http://localhost >/dev/null; then
+                  log "Health check passed - deployment successful"
+                  return 0
+              else
+                  log "Health check failed"
+                  return 1
+              fi
+          else
+              log "Failed to start container"
+              return 1
+          fi
+      }
+      
+      # Check if this is the initial run or a scheduled run
+      if [ "$1" = "--check" ]; then
+          # This is a scheduled check - only deploy if there's a new image
+          CURRENT_IMAGE_ID=$(docker inspect --format='{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+          
+          if acr_login; then
+              docker pull "$ACR_NAME.azurecr.io/$IMAGE_NAME:latest" >/dev/null 2>&1
+              NEW_IMAGE_ID=$(docker inspect --format='{{.Id}}' "$ACR_NAME.azurecr.io/$IMAGE_NAME:latest" 2>/dev/null || echo "")
+              
+              if [ "$CURRENT_IMAGE_ID" != "$NEW_IMAGE_ID" ] && [ -n "$NEW_IMAGE_ID" ]; then
+                  log "New image detected, deploying..."
+                  deploy_app
+              else
+                  log "No new image found, skipping deployment"
+              fi
+          else
+              log "ACR login failed during scheduled check"
+          fi
+      else
+          # This is initial deployment or manual run
+          deploy_app
+      fi
+    path: /opt/deployment/deploy.sh
+    permissions: '0755'
+    owner: ${admin_username}:${admin_username}
+
+  - content: |
+      [Unit]
+      Description=Auto Deploy WebAPI
+      Wants=auto-deploy.timer
+      
+      [Service]
+      Type=oneshot
+      User=${admin_username}
+      ExecStart=/opt/deployment/deploy.sh --check
+      StandardOutput=append:/var/log/webapi/deploy.log
+      StandardError=append:/var/log/webapi/deploy.log
+      
+      [Install]
+      WantedBy=multi-user.target
+    path: /etc/systemd/system/auto-deploy.service
+    permissions: '0644'
+
+  - content: |
+      [Unit]
+      Description=Run auto-deploy every 5 minutes
+      Requires=auto-deploy.service
+      
+      [Timer]
+      OnCalendar=*:0/5
+      Persistent=true
+      
+      [Install]
+      WantedBy=timers.target
+    path: /etc/systemd/system/auto-deploy.timer
+    permissions: '0644'
+
+  - content: |
+      #!/bin/bash
+      curl -f http://localhost/health 2>/dev/null || curl -f http://localhost/ 2>/dev/null || exit 1
+    path: /usr/local/bin/health-check.sh
+    permissions: '0755'
+
+final_message: "VM setup complete. Docker and auto-deployment configured."

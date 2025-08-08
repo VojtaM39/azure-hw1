@@ -1,0 +1,17 @@
+# Terraform Variables Example
+# Copy this file to terraform.tfvars and update with your values
+
+# Azure Resource Configuration
+resource_group_name = "webapi-rg"
+location           = "West Europe"
+prefix             = "webapi"
+
+# Virtual Machine Configuration
+vm_size        = "Standard_B2s"
+admin_username = "azureuser"
+
+# SSH Key Path (generate with: ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa_azure)
+ssh_public_key_path = "~/.ssh/id_rsa_azure.pub"
+
+# GitHub Repository for OIDC Federation (format: owner/repo)
+github_repository = "your-username/your-repo-name"

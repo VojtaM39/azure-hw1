@@ -1,0 +1,51 @@
+name: Deploy to Azure Container Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Azure Login with OIDC
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to Azure Container Registry
+      run: |
+        az acr login --name ${{ secrets.ACR_NAME }}
+
+    - name: Build and push Docker image
+      run: |
+        ACR_LOGIN_SERVER=$(az acr show --name ${{ secrets.ACR_NAME }} --query loginServer --output tsv)
+        docker build -t $ACR_LOGIN_SERVER/webapi:latest -t $ACR_LOGIN_SERVER/webapi:${{ github.sha }} ./app
+        docker push $ACR_LOGIN_SERVER/webapi:latest
+        docker push $ACR_LOGIN_SERVER/webapi:${{ github.sha }}
+
+    - name: Trigger deployment notification
+      run: |
+        ACR_LOGIN_SERVER=$(az acr show --name ${{ secrets.ACR_NAME }} --query loginServer --output tsv)
+        echo "Image pushed to ACR: $ACR_LOGIN_SERVER/webapi:latest"
+        echo "The VM will automatically detect and deploy the new image within 5 minutes."
